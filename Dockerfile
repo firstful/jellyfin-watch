@@ -3,7 +3,7 @@ FROM python:3.11-slim
 RUN pip install --no-cache-dir watchdog==6.0.0
 
 WORKDIR /app
-COPY watcher.py .
+COPY --chmod=644 watcher.py .
 
 ENV WATCH_ROOT=/mnt/media \
     DEBOUNCE_SECONDS=20 \
