@@ -17,6 +17,7 @@ Config (env):
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -49,6 +50,30 @@ class _Handler(FileSystemEventHandler):
             return
         self.last_event = time.time()
         log.info("change: %s %s", event.event_type, event.src_path)
+
+
+def scan_is_running() -> bool:
+    """True when Jellyfin's Scan Media Library task is Running/Cancelling.
+
+    Every POST /Library/Refresh cancels the in-flight scan, so a watcher that
+    fires blind keeps scans at ~0% during busy writes (scan cancel-loop).
+    Defer instead: report busy and let main() retry after MIN_INTERVAL.
+    """
+    if not (JELLYFIN_URL and JELLYFIN_API_KEY):
+        return False
+    try:
+        req = urllib.request.Request(
+            f"{JELLYFIN_URL}/ScheduledTasks",
+            headers={"X-Emby-Token": JELLYFIN_API_KEY},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tasks = json.load(resp)
+        for t in tasks or []:
+            if t.get("Name") == "Scan Media Library":
+                return t.get("State") in ("Running", "Cancelling")
+    except Exception as exc:  # noqa: BLE001
+        log.error("task query failed: %s: %s", type(exc).__name__, exc)
+    return False  # optimistic if we can't query — MIN_INTERVAL still coalesces
 
 
 def refresh() -> bool:
@@ -94,6 +119,13 @@ def main() -> None:
             quiet = now - handler.last_event
             since = now - last_refresh
             if quiet >= DEBOUNCE and since >= MIN_INTERVAL:
+                if scan_is_running():
+                    # Never cancel an in-flight scan. Leave last_event set and
+                    # reset the interval clock so we retry in MIN_INTERVAL —
+                    # coalesced backoff instead of the scan cancel-loop.
+                    log.info("scan in progress, deferring refresh")
+                    last_refresh = now
+                    continue
                 if refresh():
                     handler.last_event = 0.0
                     last_refresh = time.time()
