@@ -14,6 +14,9 @@ Config (env):
     DEBOUNCE_SECONDS     default 20             quiet time after last event before refresh
     MIN_INTERVAL_SECONDS default 60             floor between refreshes (anti-hammer)
     STARTUP_REFRESH      default 1              fire one refresh at boot (covers downtime)
+    EXCLUDE_DIRS         default ".yt-sync-work,.dupes_kids,_stash,stash-fakes"
+                                                comma-separated dir names ignored anywhere
+                                                in the tree (quarantine/temp work dirs)
 """
 from __future__ import annotations
 
@@ -38,15 +41,43 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("jellyfin-watch")
 
 
+EXCLUDE_DIRS = {
+    d.strip()
+    for d in os.environ.get(
+        "EXCLUDE_DIRS", ".yt-sync-work,.dupes_kids,_stash,stash-fakes"
+    ).split(",")
+    if d.strip()
+}
+
+WRITE_EVENTS = frozenset({"created", "modified", "moved", "deleted"})
+
+
+def _is_write(event: FileSystemEvent) -> bool:
+    """True only for events that indicate a real content change.
+
+    Reads (opened / closed_no_write) are NOT changes. Jellyfin's own scan
+    reads the tree, and counting reads as changes creates a self-sustaining
+    refresh loop: scan reads files -> events -> refresh -> scan reads again.
+    """
+    if event.event_type in WRITE_EVENTS:
+        return True
+    if event.event_type == "closed":
+        return not getattr(event, "no_write", True)
+    return False
+
+
 class _Handler(FileSystemEventHandler):
     def __init__(self) -> None:
         self.last_event: float = 0.0
 
     def on_any_event(self, event: FileSystemEvent) -> None:
-        # Ignore hidden paths (temp/work/stash dirs like .yt-sync-work,
-        # .dupes_kids) — real publishes always land or rename into a
-        # visible path, which fires its own event.
-        if "/." in event.src_path:
+        # Ignore hidden paths (temp/work dirs like .yt-sync-work) and
+        # quarantine dirs (stash-fakes, _stash) — real publishes always land
+        # or rename into a visible path, which fires its own event.
+        parts = set(event.src_path.split("/"))
+        if any(p.startswith(".") for p in parts) or parts & EXCLUDE_DIRS:
+            return
+        if not _is_write(event):
             return
         self.last_event = time.time()
         log.info("change: %s %s", event.event_type, event.src_path)
